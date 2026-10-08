@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>City Road Game</title>
+<style>
+html,body{height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
+*{-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+#game{position:fixed;inset:0;background:#3ac764;overflow:hidden;outline:none}
+.board{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)}
+.road{position:absolute;background:#333}
+.block{position:absolute;overflow:visible}
+img{display:block;max-width:100%;height:auto}
+.building{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);cursor:pointer;touch-action:manipulation;z-index:20}
+.tree{position:absolute;pointer-events:none}
+.tree.ground{z-index:20}
+.lion{position:absolute;touch-action:manipulation;cursor:pointer;
+  transition:left var(--slide) ease,top var(--slide) ease,transform 300ms cubic-bezier(.2,.9,.2,1)}
+.car{position:absolute;pointer-events:none;z-index:30;transform-origin:50% 50%;
+  transition:left 300ms linear,top 300ms linear,transform 200ms linear}
+
+.pad{
+  --k:clamp(52px,11vmin,76px);
+  position:fixed;z-index:10000;
+  bottom:calc(16px + env(safe-area-inset-bottom,0px));
+  display:grid;grid-template-columns:repeat(2,var(--k));grid-template-rows:repeat(3,var(--k));gap:calc(var(--k)*.14);
+}
+.pad.l{left:calc(16px + env(safe-area-inset-left,0px))}
+.pad.r{right:calc(16px + env(safe-area-inset-right,0px))}
+.pad button{
+  padding:0;border:none;border-radius:calc(var(--k)*.22);
+  font-size:calc(var(--k)*.45);line-height:1;color:#222;
+  background:linear-gradient(#f6f6f6,#bcbcbc);
+  box-shadow:0 4px 0 #858585,0 7px 10px rgba(0,0,0,.35);
+  opacity:.85;touch-action:manipulation;cursor:pointer;
+}
+.pad button:active{opacity:1;transform:translateY(3px);box-shadow:0 1px 0 #858585,0 2px 4px rgba(0,0,0,.35)}
+.pad .fwd,.pad .look{grid-column:1 / 3}
+.pad .look{background:linear-gradient(#ffeb8f,#e8b620);box-shadow:0 4px 0 #a07c08,0 7px 10px rgba(0,0,0,.35);font-size:calc(var(--k)*.5)}
+.pad .look:active{box-shadow:0 1px 0 #a07c08,0 2px 4px rgba(0,0,0,.35)}
+.pad .look.miss{animation:shake 300ms}
+@keyframes shake{0%,100%{translate:0}25%{translate:-8px}75%{translate:8px}}
+</style>
+</head>
+<body>
+<div id="game" tabindex="0"></div>
+<div class="pad l">
+  <button type="button" class="fwd" data-act="forward" aria-label="Forward">↑</button>
+  <button type="button" data-act="left" aria-label="Turn left">←</button>
+  <button type="button" data-act="right" aria-label="Turn right">→</button>
+  <button type="button" class="look" data-act="look" aria-label="Investigate">🔍</button>
+</div>
+<div class="pad r">
+  <button type="button" class="fwd" data-act="forward" aria-label="Forward">↑</button>
+  <button type="button" data-act="left" aria-label="Turn left">←</button>
+  <button type="button" data-act="right" aria-label="Turn right">→</button>
+  <button type="button" class="look" data-act="look" aria-label="Investigate">🔍</button>
+</div>
+<script>
+(() => {
+  const ASSET_PATH = 'city';
+  const AUDIO_PATH = 'audio';
+  const BUILDINGS = [
+    "airport.png","amusement park.png","aquarium.png","bank.png","bookstore.png","bridge.png","bus stop.png","castle.png","church.png","city hall.png","convenience store.png","department store.png","dome.png","elementary school.png","factory.png","farm.png","fire station.png","flower shop.png","gas station.png","harbor.png","hospital.png","hotel.png","house.png","junior high school.png","kindergarten.png","library.png","museum.png","park.png","police station.png","post office.png","restaurant.png","shrine.png","stadium.png","station.png","supermarket.png","temple.png","theater.png","tower.png","zoo.png"
+  ];
+
+  const ROWS = 4, COLS = 6, N = ROWS * COLS;
+  const SLIDE_MS = 700;
+  const DIRS = [[0,-1],[1,0],[0,1],[-1,0]]; // up, right, down, left
+
+  const rand = n => Math.floor(Math.random() * n);
+  function shuffle(a){
+    for(let i = a.length - 1; i > 0; i--){
+      const j = rand(i + 1);
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+  const treeSpec = () => ({ n: 1 + rand(3), s: Math.random(), x: Math.random(), y: Math.random() });
+
+  // Persistent state: survives resize / re-layout.
+  const state = {
+    order: shuffle(BUILDINGS.slice()).slice(0, N),
+    trees: Array.from({length: N}, (_, i) => ({
+      ground: Array.from({length: 1 + rand(8)}, treeSpec),
+      top: i < COLS ? Array.from({length: 1 + rand(10)}, treeSpec) : []
+    })),
+    lion: rand(N),
+    revealed: false,
+    busy: false,
+    hiddenAt: null,  // block index while the lion is ducking mid-relocation
+    found: false,    // set when caught ducking
+    car: {cx: 0, cy: 0},   // half-block grid coordinates
+    angle: 90              // cumulative degrees; 90 = facing right
+  };
+
+  const game = document.getElementById('game');
+  const board = document.createElement('div');
+  board.className = 'board';
+  game.appendChild(board);
+  document.documentElement.style.setProperty('--slide', SLIDE_MS + 'ms');
+
+  let v = null; // current geometry + elements
+
+  // ---------- audio ----------
+  const sounds = {};
+  function play(name){
+    try{
+      let a = sounds[name];
+      if(!a) a = sounds[name] = new Audio(AUDIO_PATH + '/' + encodeURIComponent(name) + '.wav');
+      a.currentTime = 0;
+      const p = a.play();
+      if(p && p.catch) p.catch(() => {});
+    }catch(e){}
+  }
+
+  // ---------- layout ----------
+  function layout(){
+    const W = window.innerWidth, H = window.innerHeight;
+    const road = Math.max(28, Math.floor(Math.min(W, H) * 0.06));
+    const block = Math.max(1, Math.min(
+      Math.floor((W - road * (COLS + 1)) / COLS),
+      Math.floor((H - road * (ROWS + 1)) / ROWS)
+    ));
+    const boardW = block * COLS + road * (COLS + 1);
+    const boardH = block * ROWS + road * (ROWS + 1);
+    const unit = (block + road) / 2;
+
+    board.style.width = boardW + 'px';
+    board.style.height = boardH + 'px';
+    board.replaceChildren();
+    const frag = document.createDocumentFragment();
+
+    for(let r = 0; r <= ROWS; r++){
+      const d = document.createElement('div');
+      d.className = 'road';
+      d.style.cssText = `left:0;top:${r * (block + road)}px;width:${boardW}px;height:${road}px`;
+      frag.appendChild(d);
+    }
+    for(let c = 0; c <= COLS; c++){
+      const d = document.createElement('div');
+      d.className = 'road';
+      d.style.cssText = `left:${c * (block + road)}px;top:0;width:${road}px;height:${boardH}px`;
+      frag.appendChild(d);
+    }
+
+    for(let i = 0; i < N; i++){
+      const rx = i % COLS, ry = Math.floor(i / COLS);
+      const blk = document.createElement('div');
+      blk.className = 'block';
+      blk.style.cssText = `left:${road + rx * (block + road)}px;top:${road + ry * (block + road)}px;width:${block}px;height:${block}px`;
+
+      const file = state.order[i];
+      const name = file.replace(/\.png$/, '');
+      const img = document.createElement('img');
+      img.className = 'building';
+      img.src = ASSET_PATH + '/' + encodeURIComponent(file);
+      img.alt = name;
+      img.draggable = false;
+      img.style.width = Math.round(block * 0.9) + 'px';
+      img.addEventListener('click', () => play(name));
+      blk.appendChild(img);
+
+      const makeTree = (t) => {
+        const tree = document.createElement('img');
+        tree.className = 'tree';
+        tree.src = `${ASSET_PATH}/tree${t.n}.png`;
+        tree.draggable = false;
+        tree.style.width = Math.round(block * 0.25 * (0.85 + t.s * 0.3)) + 'px';
+        tree.style.left = Math.round(t.x * block * 0.85) + 'px';
+        return tree;
+      };
+      state.trees[i].ground.forEach(t => {
+        const tree = makeTree(t);
+        tree.classList.add('ground');
+        tree.style.bottom = (Math.round(road * 0.1) + Math.round(t.y * 10 - 10)) + 'px';
+        blk.appendChild(tree);
+      });
+      state.trees[i].top.forEach(t => {
+        const tree = makeTree(t);
+        tree.style.top = (-Math.round(road * 1.5) + Math.round(t.y * 10 - 25)) + 'px';
+        blk.appendChild(tree);
+      });
+      frag.appendChild(blk);
+    }
+
+    const lionSize = Math.round(block * 0.7);
+    const lion = document.createElement('img');
+    lion.className = 'lion';
+    lion.src = ASSET_PATH + '/lion.png';
+    lion.alt = 'lion';
+    lion.draggable = false;
+    lion.style.width = lionSize + 'px';
+    lion.addEventListener('click', relocate);
+    frag.appendChild(lion);
+
+    const carSize = Math.round(Math.min(block, road) * 0.9);
+    const car = document.createElement('img');
+    car.className = 'car';
+    car.src = ASSET_PATH + '/car.png';
+    car.alt = 'vehicle';
+    car.draggable = false;
+    car.style.width = carSize + 'px';
+    car.style.height = carSize + 'px';
+    frag.appendChild(car);
+
+    board.appendChild(frag);
+    v = {road, block, unit, lion, lionSize, car, carSize, shift: Math.round(block * 0.4)};
+    applyLion();
+    placeCar();
+  }
+
+  // ---------- lion ----------
+  function applyLionPos(){
+    const rx = state.lion % COLS, ry = Math.floor(state.lion / COLS);
+    v.lion.style.left = Math.round(v.road + rx * (v.block + v.road) + (v.block - v.lionSize) / 2) + 'px';
+    v.lion.style.top  = Math.round(v.road + ry * (v.block + v.road) + (v.block - v.lionSize) / 2) + 'px';
+  }
+  function applyLion(){
+    applyLionPos();
+    v.lion.style.transform = state.revealed ? `translateY(-${v.shift}px)` : 'translateY(0)';
+    v.lion.style.zIndex = state.revealed ? 9999 : 2;
+  }
+  function reveal(){
+    state.revealed = true;
+    applyLion();
+    play('pop');
+  }
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  function lionPx(i){
+    const rx = i % COLS, ry = Math.floor(i / COLS);
+    return {
+      x: Math.round(v.road + rx * (v.block + v.road) + (v.block - v.lionSize) / 2),
+      y: Math.round(v.road + ry * (v.block + v.road) + (v.block - v.lionSize) / 2)
+    };
+  }
+  function lionPose(flip, rot){
+    return `translateY(-${v.shift}px) scaleX(${flip}) rotate(${rot * flip}deg)`;
+  }
+  // Lion art faces left. Facing changes per relocation: right, left, right (max 3).
+  const FLIPS_MAX = 3;
+  let flip = 1, flips = 0;
+  async function zipTo(p, ms){
+    const l = v.lion;
+    const cx = parseFloat(l.style.left) || 0;
+    const tilt = p.x > cx + 4 ? 10 : p.x < cx - 4 ? -10 : 0;
+    const e = `${ms}ms cubic-bezier(.2,.9,.3,1)`;
+    l.style.transition = `left ${e}, top ${e}, transform 90ms`;
+    l.style.left = p.x + 'px';
+    l.style.top = p.y + 'px';
+    l.style.transform = lionPose(flip, tilt);
+    await sleep(ms);
+    v.lion.style.transform = lionPose(flip, 0);
+  }
+  async function flipOnce(ms){
+    if(flips >= FLIPS_MAX) return;
+    flips++;
+    flip = -flip;
+    v.lion.style.transition = `transform ${ms}ms`;
+    v.lion.style.transform = lionPose(flip, 0);
+    await sleep(ms + 100);
+  }
+  async function doubleTake(){
+    await flipOnce(140);
+    if(flips < FLIPS_MAX && Math.random() < .5){
+      await sleep(120 + rand(140));
+      await flipOnce(140);
+    }
+    await sleep(120 + rand(140));
+  }
+  // dive under a building, wait, pop back out (instantly if caught)
+  async function hideAndPop(k){
+    await zipTo(lionPx(k), 320);
+    v.lion.style.transition = 'transform 280ms ease-in';
+    v.lion.style.transform = `translateY(0) scaleX(${flip})`;
+    await sleep(300);
+    v.lion.style.zIndex = 2;
+    state.hiddenAt = k;
+    const until = Date.now() + 1800 + rand(2200);
+    while(Date.now() < until && !state.found) await sleep(40);
+    state.hiddenAt = null;
+    v.lion.style.zIndex = 9999;
+    v.lion.style.transition = 'transform 280ms cubic-bezier(.2,.9,.2,1)';
+    v.lion.style.transform = lionPose(flip, 0);
+    play('pop');
+    await sleep(state.found ? 300 : 450);
+  }
+  // 0 hides most often, 1 less, 2 rarest
+  function pickHides(){
+    const r = Math.random();
+    return r < .6 ? 0 : r < .88 ? 1 : 2;
+  }
+  async function relocate(){
+    if(!state.revealed || state.busy) return;
+    let n;
+    do{ n = rand(N); }while(n === state.lion);
+    state.busy = true;
+    state.found = false;
+    flip = 1; flips = 0;
+    const from = state.lion;
+    state.lion = n;
+    play('move');
+
+    let cur = lionPx(from);
+    let last = from;
+    const legs = 7 + rand(5);
+    const hideAt = new Set();
+    const hides = pickHides();
+    while(hideAt.size < hides) hideAt.add(1 + rand(legs - 1));
+
+    const other = () => { let k; do{ k = rand(N); }while(k === last); return k; };
+
+    for(let i = 0; i < legs; i++){
+      const r = Math.random();
+      if(r < .3){
+        if(flips < FLIPS_MAX) await doubleTake(); else await sleep(300);
+      }else if(r < .65){
+        // fake-out: head toward a block, stop short, then bolt elsewhere
+        const t = lionPx(other());
+        const f = .35 + Math.random() * .4;
+        const p = {x: Math.round(lerp(cur.x, t.x, f)), y: Math.round(lerp(cur.y, t.y, f))};
+        await zipTo(p, 200 + rand(100));
+        cur = p;
+        await sleep(200 + rand(250));
+        if(Math.random() < .5){
+          const lp = lionPx(last);
+          const back = {x: Math.round(lerp(p.x, lp.x, .8)), y: Math.round(lerp(p.y, lp.y, .8))};
+          await zipTo(back, 170 + rand(80));
+          cur = back;
+          await sleep(120 + rand(180));
+        }
+      }else{
+        const k = other();
+        const p = lionPx(k);
+        await zipTo(p, 260 + rand(160));
+        cur = p; last = k;
+        await sleep(150 + rand(350));
+      }
+      if(hideAt.has(i)){
+        const k = other();
+        await hideAndPop(k);
+        if(state.found){
+          // caught ducking: stays out at this block, counts as found
+          state.found = false;
+          state.lion = k;
+          v.lion.style.transition = '';
+          state.busy = false;
+          return;
+        }
+        cur = lionPx(k); last = k;
+      }
+    }
+    await zipTo(lionPx(n), 300);
+    await sleep(250);
+    v.lion.style.transition = '';
+    state.revealed = false;
+    state.busy = false;
+    applyLion();
+  }
+
+  // ---------- vehicle ----------
+  function placeCar(){
+    const x = v.road / 2 + state.car.cx * v.unit;
+    const y = v.road / 2 + state.car.cy * v.unit;
+    v.car.style.left = Math.round(x - v.carSize / 2) + 'px';
+    v.car.style.top  = Math.round(y - v.carSize / 2) + 'px';
+    v.car.style.transform = `rotate(${state.angle}deg)`;
+  }
+  function turn(d){
+    state.angle += d * 90;
+    placeCar();
+  }
+  function forward(){
+    const dir = ((state.angle / 90) % 4 + 4) % 4;
+    const cx = state.car.cx + DIRS[dir][0];
+    const cy = state.car.cy + DIRS[dir][1];
+    if(cx < 0 || cy < 0 || cx > 2 * COLS || cy > 2 * ROWS) return;
+    if(cx % 2 && cy % 2) return; // block interior: not drivable
+    state.car = {cx, cy};
+    placeCar();
+  }
+
+  // ---------- investigate ----------
+  // Checks blocks bordering the vehicle's current road position (left and right sides).
+  function isNear(i){
+    const lx = 2 * (i % COLS) + 1;
+    const ly = 2 * Math.floor(i / COLS) + 1;
+    return Math.abs(lx - state.car.cx) <= 1 && Math.abs(ly - state.car.cy) <= 1;
+  }
+  function investigate(src){
+    if(state.busy){
+      // lion ducking mid-relocation: still catchable
+      if(state.hiddenAt !== null){
+        if(isNear(state.hiddenAt)) state.found = true; else miss(src);
+      }
+      return;
+    }
+    if(!isNear(state.lion)){ miss(src); return; }
+    if(state.revealed) relocate(); else reveal();
+  }
+  function miss(src){
+    const list = src ? [src] : document.querySelectorAll('.look');
+    list.forEach(b => {
+      b.classList.remove('miss');
+      void b.offsetWidth;
+      b.classList.add('miss');
+    });
+  }
+  document.querySelectorAll('.look').forEach(b =>
+    b.addEventListener('animationend', () => b.classList.remove('miss')));
+
+  // ---------- input (registered once; both pads drive the same vehicle) ----------
+  const actions = {
+    left: () => turn(-1),
+    right: () => turn(1),
+    forward,
+    look: investigate
+  };
+  document.querySelectorAll('.pad button').forEach(b => {
+    b.addEventListener('click', () => { actions[b.dataset.act](b); b.blur(); });
+  });
+
+  const keys = {
+    'ArrowLeft': () => turn(-1),
+    'ArrowRight': () => turn(1),
+    'ArrowUp': forward,
+    ' ': investigate
+  };
+  window.addEventListener('keydown', ev => {
+    const fn = keys[ev.key];
+    if(!fn) return;
+    ev.preventDefault();
+    fn();
+  });
+  window.addEventListener('keyup', ev => { if(ev.key === ' ') ev.preventDefault(); });
+
+  let resizeTimer;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(layout, 120);
+  });
+
+  layout();
+  game.focus();
+})();
+</script>
+</body>
+</html>

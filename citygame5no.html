@@ -157,7 +157,7 @@ img{display:block;max-width:100%;height:auto}
     frag.appendChild(lion);
 
     board.appendChild(frag);
-    v = {road, block, unit, lion, lionSize, shift: Math.round(block * 0.4)};
+    v = {road, block, unit, boardW, boardH, lion, lionSize, shift: Math.round(block * 0.4)};
     applyLion();
   }
 
@@ -192,16 +192,36 @@ img{display:block;max-width:100%;height:auto}
   // Lion art faces left. Facing changes per relocation: right, left, right (max 3).
   const FLIPS_MAX = 3;
   let flip = 1, flips = 0;
-  async function zipTo(p, ms){
-    const l = v.lion;
-    const cx = parseFloat(l.style.left) || 0;
-    const tilt = p.x > cx + 4 ? 10 : p.x < cx - 4 ? -10 : 0;
-    const e = `${ms}ms cubic-bezier(.2,.9,.3,1)`;
-    l.style.transition = `left ${e}, top ${e}, transform 90ms`;
-    l.style.left = p.x + 'px';
-    l.style.top = p.y + 'px';
-    l.style.transform = lionPose(flip, tilt);
-    await sleep(ms);
+  // curved, non-linear zip: bowed bezier path with optional wiggle, eased
+  async function zipTo(p, ms, slam){
+    const l0 = v.lion;
+    const x0 = parseFloat(l0.style.left) || 0, y0 = parseFloat(l0.style.top) || 0;
+    const dx = p.x - x0, dy = p.y - y0;
+    const dist = Math.hypot(dx, dy) || 1;
+    const nx = -dy / dist, ny = dx / dist;
+    const bow = (Math.random() < .5 ? -1 : 1) * dist * (.15 + Math.random() * .4);
+    const cx = (x0 + p.x) / 2 + nx * bow, cy = (y0 + p.y) / 2 + ny * bow;
+    const waves = !slam && Math.random() < .4 ? 2 + rand(2) : 0;
+    const amp = waves ? dist * (.06 + Math.random() * .1) : 0;
+    const tilt = dx > 4 ? 10 : dx < -4 ? -10 : 0;
+    l0.style.transition = 'transform 60ms';
+    l0.style.transform = lionPose(flip, tilt);
+    const t0 = performance.now();
+    await new Promise(res => {
+      const step = now => {
+        const t = Math.min(1, (now - t0) / ms);
+        const e = slam ? t * t : 1 - Math.pow(1 - t, 2.4); // slam: accelerates into the spot; else fast start, quick settle
+        const u = 1 - e;
+        const w = Math.sin(e * Math.PI * waves) * amp * (1 - e);
+        const x = u * u * x0 + 2 * u * e * cx + e * e * p.x + nx * w;
+        const y = u * u * y0 + 2 * u * e * cy + e * e * p.y + ny * w;
+        const l = v.lion;
+        l.style.left = Math.round(x) + 'px';
+        l.style.top = Math.round(y) + 'px';
+        if(t < 1) requestAnimationFrame(step); else res();
+      };
+      requestAnimationFrame(step);
+    });
     v.lion.style.transform = lionPose(flip, 0);
   }
   async function flipOnce(ms){
@@ -213,19 +233,23 @@ img{display:block;max-width:100%;height:auto}
     await sleep(ms + 100);
   }
   async function doubleTake(){
-    await flipOnce(140);
+    await flipOnce(100);
     if(flips < FLIPS_MAX && Math.random() < .5){
-      await sleep(120 + rand(140));
-      await flipOnce(140);
+      await sleep(60 + rand(80));
+      await flipOnce(100);
     }
-    await sleep(120 + rand(140));
+    await sleep(40 + rand(80));
+  }
+  // zip in at full speed and plunge straight under the building (no slow-down)
+  async function dive(i){
+    await zipTo(lionPx(i), 150, true);
+    v.lion.style.transition = 'transform 90ms cubic-bezier(.5,0,1,.6)';
+    v.lion.style.transform = `translateY(0) scaleX(${flip})`;
+    await sleep(90);
   }
   // dive under a building, wait, pop back out (instantly if caught)
   async function hideAndPop(k){
-    await zipTo(lionPx(k), 320);
-    v.lion.style.transition = 'transform 280ms ease-in';
-    v.lion.style.transform = `translateY(0) scaleX(${flip})`;
-    await sleep(300);
+    await dive(k);
     v.lion.style.zIndex = 2;
     state.hiddenAt = k;
     const until = Date.now() + 1800 + rand(2200);
@@ -255,38 +279,54 @@ img{display:block;max-width:100%;height:auto}
 
     let cur = lionPx(from);
     let last = from;
-    const legs = 7 + rand(5);
+    const legs = 14 + rand(9);
     const hideAt = new Set();
     const hides = pickHides();
-    while(hideAt.size < hides) hideAt.add(1 + rand(legs - 1));
+    while(hideAt.size < hides) hideAt.add(2 + rand(legs - 3));
 
     const other = () => { let k; do{ k = rand(N); }while(k === last); return k; };
+    const anywhere = () => ({x: rand(Math.max(1, v.boardW - v.lionSize)), y: rand(Math.max(1, v.boardH - v.lionSize))});
 
     for(let i = 0; i < legs; i++){
       const r = Math.random();
-      if(r < .3){
-        if(flips < FLIPS_MAX) await doubleTake(); else await sleep(300);
-      }else if(r < .65){
+      if(r < .15){
+        if(flips < FLIPS_MAX) await doubleTake(); else await sleep(80);
+      }else if(r < .4){
         // fake-out: head toward a block, stop short, then bolt elsewhere
         const t = lionPx(other());
         const f = .35 + Math.random() * .4;
         const p = {x: Math.round(lerp(cur.x, t.x, f)), y: Math.round(lerp(cur.y, t.y, f))};
-        await zipTo(p, 200 + rand(100));
+        await zipTo(p, 110 + rand(80));
         cur = p;
-        await sleep(200 + rand(250));
+        await sleep(60 + rand(100));
         if(Math.random() < .5){
           const lp = lionPx(last);
           const back = {x: Math.round(lerp(p.x, lp.x, .8)), y: Math.round(lerp(p.y, lp.y, .8))};
-          await zipTo(back, 170 + rand(80));
+          await zipTo(back, 100 + rand(70));
           cur = back;
-          await sleep(120 + rand(180));
+          await sleep(40 + rand(80));
+        }
+      }else if(r < .65){
+        // scatter: quick hops to arbitrary points on the board
+        const hops = 2 + rand(3);
+        for(let h = 0; h < hops; h++){
+          const p = anywhere();
+          await zipTo(p, 90 + rand(70));
+          cur = p;
+          await sleep(rand(50));
         }
       }else{
         const k = other();
         const p = lionPx(k);
-        await zipTo(p, 260 + rand(160));
+        if(Math.random() < .3){
+          // overshoot, then snap back
+          const o = {x: Math.round(lerp(cur.x, p.x, 1.25)), y: Math.round(lerp(cur.y, p.y, 1.25))};
+          await zipTo(o, 120 + rand(60));
+          await sleep(30 + rand(50));
+        }
+        await zipTo(p, 130 + rand(100));
         cur = p; last = k;
-        await sleep(150 + rand(350));
+        if(Math.random() < .5) await sleep(30 + rand(120));
       }
       if(hideAt.has(i)){
         const k = other();
@@ -302,8 +342,7 @@ img{display:block;max-width:100%;height:auto}
         cur = lionPx(k); last = k;
       }
     }
-    await zipTo(lionPx(n), 300);
-    await sleep(250);
+    await dive(n);
     v.lion.style.transition = '';
     state.revealed = false;
     state.busy = false;
